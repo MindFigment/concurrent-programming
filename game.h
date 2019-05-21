@@ -1,0 +1,26 @@
+typedef struct button_cords_st button_cords_t;
+typedef struct path_cell_st path_cell_t;
+typedef struct cell_update_st cell_update_t;
+typedef struct path_st path_t;
+typedef struct player_st player_t;
+
+void init_display();
+void dispose_display();
+void draw_grid();
+void draw_board();
+void game_loop();
+void draw_current_player_title(int player);
+void draw_player_score(player_t player);
+void draw_players_scores();
+void draw_roll_dice_button(char *button_string);
+int check_if_roll_dice(int, int);
+path_t *generate_path(int, int, int, int);
+int get_step_from_random_number(int, int, int, int);
+cell_update_t update_cell_from_step(int);
+void draw_path( path_t *path_struct);
+void draw_shroom(char *shroom_color, path_cell_t cell);
+void draw_path_cell(char *cell_color, path_cell_t cell);
+void draw_player(int player, path_cell_t cell);
+void update_game_state(int draw, int player);
+void draw_players_positions();
+void init_game();
