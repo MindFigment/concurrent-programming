@@ -4,8 +4,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
 #include <time.h>
+#include <sys/shm.h>
+#include <sys/ipc.h>    
+#include <sys/sem.h>
+#include <signal.h>
 
 #include <game.h>
 
@@ -32,6 +35,10 @@
 #define FALSE 0
 
 #define MAX_PLAYERS 6
+
+#define SEM_KEY 1123
+#define GAME_STATE_KEY 6667
+#define SEM 0
 
 typedef struct button_cords_st {
     int x1;
@@ -63,6 +70,16 @@ typedef struct path_st {
     player_t *players;
 } path_t;
 
+typedef struct game_state_st {
+    path_cell_t path[100];
+    int path_len;
+    player_t players[MAX_PLAYERS];
+    int player_num;
+    int player_turn;
+    int active;
+    int players_finished;
+} game_state_t;
+
 Display *display;
 int screen;
 GC gc;
@@ -71,6 +88,7 @@ Colormap colormap;
 int x11_file_descriptor;
 XColor color, exact_color;
 XEvent event;
+struct timeval tv;
 
 int already_rolled_dice = FALSE;
 path_t *path_struct;
@@ -79,10 +97,99 @@ int current_player = 0;
 button_cords_t *roll_dice_button_cords;
 
 
+int shm_path_id;
+int player_id;
+int semaphore;
+path_t *shm_path;
+game_state_t *shm_game_state;
+int shm_game_state_id;
+
+struct sembuf semopdec = {SEM, -1 , 0};
+struct sembuf semopwait[2];
+
+int did_i_finished = FALSE;
+
+
 int main() {
+    signal(SIGINT, cleanup);
+    init_sem_operations();
+    init_shared_state();
     init_display();
+    if (player_id == 1) {
+        shm_game_state->active = TRUE;
+    }
+    else {
+        while (shm_game_state->active != TRUE) {};
+    }
     init_game();
     game_loop();
+    cleanup(0);
+}
+
+
+void cleanup(int signal) {
+  shmdt(shm_game_state);
+  semctl(semaphore, 0, IPC_RMID, 0);
+  shmctl(shm_game_state_id, IPC_RMID, 0);
+  printf("\n");
+  exit(0);
+}
+
+void init_sem_operations() {
+    semopwait[0].sem_num = 0;
+    semopwait[0].sem_op = 0;
+    semopwait[0].sem_flg = 0;
+    semopwait[1].sem_num = 0;
+    semopwait[1].sem_op = 1;
+    semopwait[1].sem_flg = 0;
+}
+
+int init_shared_state() {
+
+    if((semaphore = semget(SEM_KEY, 1, 0666 | IPC_CREAT | IPC_EXCL)) > 0) {
+        srand(time(NULL));
+        int starty = rand() % (BOARD_HEIGHT - 1);
+        int endy = rand() % (BOARD_HEIGHT - 1);
+        path_struct = generate_path(0, starty, BOARD_WIDTH - 1, endy);
+
+        player_id = 1;
+        printf("You are player 1\n");
+
+        shm_game_state_id = shmget(GAME_STATE_KEY, sizeof(game_state_t), 0666 | IPC_CREAT);
+        shm_game_state = (game_state_t *)shmat(shm_game_state_id, 0, 0);
+        shm_game_state->path_len = path_struct->path_len;
+        memcpy(shm_game_state->path, path_struct->path, shm_game_state->path_len * sizeof(path_cell_t));
+        memcpy(shm_game_state->players, path_struct->players, MAX_PLAYERS * sizeof(player_t));
+        shm_game_state->player_num = 1;
+        shm_game_state->player_turn = 1;
+        shm_game_state->players_finished = 0;
+        shm_game_state->active = FALSE;
+
+        printf("Waiting for %i players or 10 secs\n", MAX_PLAYERS);
+        sleep(1);
+        sleep(5);
+    }
+    else {
+        semaphore = semget(SEM_KEY, 1, 0666 | IPC_CREAT);
+        semop(semaphore, semopwait, 2);
+
+        shm_game_state_id = shmget(GAME_STATE_KEY, sizeof(game_state_t), 0666 | IPC_CREAT);
+        shm_game_state = (game_state_t *)shmat(shm_game_state_id, 0, 0);
+        
+        if (shm_game_state->player_num >= MAX_PLAYERS || shm_game_state->active == TRUE) {
+            printf("Too many players!\n");
+            semop(semaphore, &semopdec, 1);
+            exit(EXIT_FAILURE);
+        }        
+
+        shm_game_state->player_num += 1;
+        player_id = shm_game_state->player_num;
+        printf("You are player %i\n", player_id);
+        
+        semop(semaphore, &semopdec, 1);
+
+        printf("Waiting for %i players or 10 secs\n", MAX_PLAYERS);
+    }
 }
 
 
@@ -95,13 +202,8 @@ void init_game() {
         printf("FIRST EXPOSE\n");
         draw_grid();
         draw_board();
-        srand(time(NULL));
-        int starty, endy;
-        starty = rand() % (BOARD_HEIGHT - 1);
-        endy = rand() % (BOARD_HEIGHT - 1);
-        path_struct = generate_path(0, starty, BOARD_WIDTH - 1, endy);
-        draw_path(path_struct);
-        draw_current_player_title(current_player);
+        draw_path();
+        draw_current_player_title(shm_game_state->player_turn);
         draw_players_scores();
         draw_roll_dice_button("ROLL DICE");
         XFlush(display);
@@ -158,55 +260,130 @@ void dispose_display() {
 }
 
 
+void exit_loop() {
+    XNextEvent(display, &event);
+    switch (event.type) {
+
+        // case Expose:
+        //     printf("Expose %i\n", event.type);
+        //     draw_grid();
+        //     draw_board();
+        //     draw_path();
+        //     draw_who_won();
+        //     draw_players_scores();
+        //     draw_roll_dice_button("GAME ENDED");
+        //     XFlush(display);
+        //     break;
+
+        // case ButtonPress:
+        //     printf("Expose %i\n", event.type);
+        //     draw_grid();
+        //     draw_board();
+        //     draw_path();
+        //     draw_who_won();
+        //     draw_players_scores();
+        //     draw_roll_dice_button("GAME ENDED");
+        //     XFlush(display);
+        //     break;
+
+        case ClientMessage:
+            free(roll_dice_button_cords);
+            free(path_struct);
+            printf("Event: window closed\n");
+            cleanup(0);
+            dispose_display();
+            break;
+    }
+}
+
+
 // Main game loop
 void game_loop() {
 
-    while(1) {
-        XNextEvent(display, &event);
-        switch (event.type) {
+    while(TRUE) {
 
-            case Expose:
-                printf("Expose %i\n", event.type);
-                draw_grid();
-                draw_board();
-                srand(time(NULL));
-                draw_path(path_struct);
-                draw_current_player_title(current_player);
+        fd_set in_fds;
+        // Create a file description set containing x11_fd
+        FD_ZERO(&in_fds);
+        FD_SET(x11_file_descriptor, &in_fds);
+
+        // Set our timer
+        tv.tv_usec = 0;
+        tv.tv_sec = 1;
+
+        // Wait for X Event or a Timer
+        int num_ready_fds = select(x11_file_descriptor + 1, &in_fds, NULL, NULL, &tv);
+        if (num_ready_fds == 0) {
+            // Handle timer here
+            if (shm_game_state->players_finished == shm_game_state->player_num) {
+                draw_who_won();
+                draw_roll_dice_button("GAME ENDED");
+            }
+            else {
+                draw_path();
+                draw_current_player_title(shm_game_state->player_turn);
                 draw_players_scores();
                 draw_roll_dice_button("ROLL DICE");
+            }
+            XFlush(display);
+        }
+
+        while(XPending(display)) {
+            printf("players finished %i , player_num %i\n", shm_game_state->players_finished, shm_game_state->player_num);
+            if (shm_game_state->players_finished == shm_game_state->player_num) {
+                draw_who_won();
+                draw_roll_dice_button("GAME ENDED");
+                exit_loop();
+            }
+            if (shm_game_state->player_turn == player_id && did_i_finished == TRUE) {
+                shm_game_state->player_turn = shm_game_state->player_turn % shm_game_state->player_num + 1;
+                draw_current_player_title(shm_game_state->player_turn);
                 XFlush(display);
-                break;
+            }
 
-            case ButtonPress:
-                printf("Event: mouse pressed\n");
-                // CHECK IF ROLL DICE BUTTON IS PRESSED FOR THE FIRST TIME IN THIS TURN
-                int result = check_if_roll_dice(event.xbutton.x, event.xbutton.y);
-                printf("Already diced: %i\n", already_rolled_dice);
-                printf("Click cords: (%i, %i)\n", event.xbutton.x, event.xbutton.y);
-                printf("Result: %i\n", result);
-                if (result == 1) {
-                    int draw = rand() % 6 + 1; 
-                    char *button_string = (char*)malloc(15 * sizeof(char));
-                    sprintf(button_string, "%s %i", "You draw:", draw);
-                    draw_roll_dice_button(button_string);
-                    // XFlush to make sure new button string gets printed before thread goes to sleep
-                    XFlush(display);
-                    // sleep(1);
-                    update_game_state(draw, current_player);
+            XNextEvent(display, &event);
+            switch (event.type) {
+
+                case Expose:
+                    printf("Expose %i\n", event.type);
+                    draw_grid();
+                    draw_board();
+                    draw_path();
+                    draw_current_player_title(shm_game_state->player_turn);
+                    draw_players_scores();
                     draw_roll_dice_button("ROLL DICE");
-                    already_rolled_dice = FALSE;
-                    current_player = (current_player + 1) % num_players;
-                    draw_current_player_title(current_player);
                     XFlush(display);
-                }
-                break;
+                    break;
 
-            case ClientMessage:
-                free(roll_dice_button_cords);
-                free(path_struct);
-                printf("Event: window closed\n");
-                dispose_display();
-                break;
+                case ButtonPress:
+                    if (shm_game_state->player_turn == player_id && did_i_finished == FALSE) {
+                        printf("Event: mouse pressed\n");
+                        // CHECK IF ROLL DICE BUTTON IS PRESSED FOR THE FIRST TIME IN THIS TURN
+                        int can_roll_dice = check_if_roll_dice(event.xbutton.x, event.xbutton.y);
+                        if (can_roll_dice == TRUE) {
+                            int draw = rand() % 6 + 1; 
+                            char *button_string = (char*)malloc(15 * sizeof(char));
+                            sprintf(button_string, "%s %i", "You draw:", draw);
+                            draw_roll_dice_button(button_string);
+                            current_player = player_id;
+                            update_game_state(draw, current_player);
+                            already_rolled_dice = FALSE;
+                            current_player = (current_player) % shm_game_state->player_num + 1;
+                            draw_current_player_title(current_player);
+                            shm_game_state->player_turn = current_player;
+                            XFlush(display);
+                        }
+                    }
+                    break;
+
+                case ClientMessage:
+                    free(roll_dice_button_cords);
+                    free(path_struct);
+                    printf("Event: window closed\n");
+                    cleanup(0);
+                    dispose_display();
+                    break;
+            }
         }
     }
 }
@@ -216,16 +393,18 @@ void game_loop() {
 // and delete this shroom 
 void update_game_state(int draw, int player_number) {
     int next_cell_number, current_cell_number, path_len;
-    player_t *player = &path_struct->players[player_number];
+    player_t *player = &shm_game_state->players[player_number - 1];
     current_cell_number = player->cell;
     next_cell_number =  current_cell_number + draw;
-    path_len = path_struct->path_len;
+    path_len = shm_game_state->path_len;
     // If next cell is greater then path len, take player to the end of the path
     if (next_cell_number >= path_len) {
         next_cell_number = path_len - 1;
+        did_i_finished = TRUE;
+        shm_game_state->players_finished += 1;
     }
-    path_cell_t *current_cell = &path_struct->path[current_cell_number];
-    path_cell_t *next_cell = &path_struct->path[next_cell_number];
+    path_cell_t *current_cell = &shm_game_state->path[current_cell_number];
+    path_cell_t *next_cell = &shm_game_state->path[next_cell_number];
     if (next_cell->state != 0) {
         if (next_cell->state == RED_SHROOM) { player->score += 3; };
         if (next_cell->state == ORANGE_SHROOM) { player->score += 2; };
@@ -256,7 +435,6 @@ void draw_grid() {
     XSetForeground(display, gc, color.pixel);
 
     int x1, y1, x2, y2;
-    // int offset_x = BOARD_WIDTH_SIZE_PX + BOARD_X_MARGIN;
     for (int i = 0; i < BOARD_HEIGHT + 1; i++) {
         // Horizontal lines
         x1 = BOARD_X_MARGIN;
@@ -264,7 +442,6 @@ void draw_grid() {
         x2 = BOARD_X_MARGIN + BOARD_WIDTH_SIZE_PX;
         y2 = BOARD_Y_MARGIN + i * CELL_SIZE_PX;
         XDrawLine(display, window, gc, x1, y1, x2, y2);   
-        // XDrawLine(display, window, gc, x1 + offset_x, y1, x2 + offset_x, y2); 
     }
 
     for (int i = 0; i < BOARD_WIDTH + 1; i++) {
@@ -300,18 +477,18 @@ void draw_board() {
 
 // Draw positions of all players of the path
 void draw_players_positions() {
-    player_t *players =  path_struct->players;
-    path_cell_t *path = path_struct->path;
-    for (int i = 0; i < num_players; i++) {
+    player_t *players = shm_game_state->players;
+    path_cell_t *path = shm_game_state->path;
+    for (int i = 0; i < shm_game_state->player_num; i++) {
         draw_player(players[i].number, path[players[i].cell]);
     }
 }
 
 
 // Draw path
-void draw_path(path_t *path_struct) {
-    int n = path_struct->path_len;
-    path_cell_t *path = path_struct->path;
+void draw_path() {
+    int n = shm_game_state->path_len;
+    path_cell_t *path = shm_game_state->path;
     draw_path_cell("grey", path[0]);
     draw_path_cell("grey", path[n - 1]);
     for(int i = 1; i < n - 1; i++) {
@@ -423,8 +600,33 @@ void draw_current_player_title(int player) {
 
     XAllocNamedColor(display, colormap, "black", &color, &exact_color);
     XSetForeground(display, gc, color.pixel);
-    char *current_player = (char*)malloc(14 * sizeof(char));
-    sprintf(current_player, "%s %i %s", "Player", player + 1, "turn");
+    char *current_player = (char*)malloc(30 * sizeof(char));
+    sprintf(current_player, "%s %i %s | You are player %i", "Player", player, "turn", player_id);
+    XDrawString(display, window, gc, x, y, current_player, strlen(current_player));
+    free(current_player);
+}
+
+// Draw which players won the game
+void draw_who_won() {
+    int player = 1;
+    int max_points = 0;
+    for (int i = 0; i < shm_game_state->player_num; i++) {
+        if (shm_game_state->players[i].score > max_points) {
+            player = i + 1;
+            max_points = shm_game_state->players[i].score;
+        }
+    }
+    int x = BOARD_X_MARGIN + BOARD_WIDTH_SIZE_PX / 2 - 30;
+    int y = BOARD_Y_MARGIN - 5;
+
+    XAllocNamedColor(display, colormap, "white", &color, &exact_color);
+    XSetForeground(display, gc, color.pixel);
+    XFillRectangle(display, window, gc, x, y - 10, 90, 10);
+
+    XAllocNamedColor(display, colormap, "black", &color, &exact_color);
+    XSetForeground(display, gc, color.pixel);
+    char *current_player = (char*)malloc(15 * sizeof(char));
+    sprintf(current_player, "%s %i %s", "Player", player, "won!");
     XDrawString(display, window, gc, x, y, current_player, strlen(current_player));
     free(current_player);
 }
@@ -432,8 +634,8 @@ void draw_current_player_title(int player) {
 
 // Draw legend containing score of every player
 void draw_players_scores() {
-    player_t *players =  path_struct->players;
-    for (int i = 0; i < num_players; i++){
+    player_t *players = shm_game_state->players;
+    for (int i = 0; i < shm_game_state->player_num; i++){
         draw_player_score(players[i]);
     }
 }
